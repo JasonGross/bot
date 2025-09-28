@@ -1103,21 +1103,31 @@ let fetch_ci_minimization_info ~bot_info ~owner ~repo ~pr_number
                   | None ->
                       `Trd check_tab_info )
           in
+          let extract_pipeline_check_errors =
+            List.filter ~f:(fun (name, _) ->
+                String.is_prefix ~prefix:"GitLab CI pipeline" name )
+          in
           match
-            ( extract_pipeline_check base_checks
-            , ((head_pipeline_summary, true), extract_pipeline_check head_checks)
-            )
+            ( ( extract_pipeline_check base_checks
+              , extract_pipeline_check_errors base_checks_errors )
+            , ( (head_pipeline_summary, true)
+              , extract_pipeline_check head_checks
+              , extract_pipeline_check_errors head_checks_errors ) )
           with
-          | ( ( [({summary= Some base_pipeline_summary}, base_pipeline_finished)]
-              , base_checks
-              , unfinished_base_checks )
+          | ( ( ( [ ( {summary= Some base_pipeline_summary}
+                    , base_pipeline_finished ) ]
+                , base_checks
+                , unfinished_base_checks )
+              , _base_pipeline_checks_errors )
             , ( ( (Some head_pipeline_summary, head_pipeline_finished)
-                , (_, head_checks, unfinished_head_checks) )
+                , (_, head_checks, unfinished_head_checks)
+                , _head_pipeline_checks_errors )
               | ( (None, _)
                 , ( [ ( {summary= Some head_pipeline_summary}
                       , head_pipeline_finished ) ]
                   , head_checks
-                  , unfinished_head_checks ) ) ) ) ->
+                  , unfinished_head_checks )
+                , _head_pipeline_checks_errors ) ) ) ->
               Lwt_io.printf
                 "Looking for failed tests to minimize among %d head checks (%d \
                  base checks) (head checks: %s) (unfinished head checks: %s) \
@@ -1177,14 +1187,15 @@ let fetch_ci_minimization_info ~bot_info ~owner ~repo ~pr_number
                   ; failed_test_suite_jobs }
                 , possible_jobs_to_minimize
                 , unminimizable_jobs )
-          | (_, _, _), ((None, _), ([({summary= None}, _)], _, _)) ->
+          | ((_, _, _), _), ((None, _), ([({summary= None}, _)], _, _), _) ->
               Lwt.return_error
                 ( Some pr_id
                 , f
                     "Could not find pipeline check summary for head commit %s \
                      and no summary was passed."
                     head )
-          | (_, _, _), ((None, _), ([], _, _)) ->
+          | ((_, _, _), _), ((None, _), ([], _, _), [])
+            when List.is_empty head_checks_errors ->
               Lwt.return_error
                 ( Some pr_id
                 , f
@@ -1194,8 +1205,47 @@ let fetch_ci_minimization_info ~bot_info ~owner ~repo ~pr_number
                     ( head_checks
                     |> List.map ~f:(fun ({name}, _) -> name)
                     |> String.concat ~sep:", " ) )
-          | (_, _, _), ((None, _), ((_ :: _ :: _ as pipeline_head_checks), _, _))
+          | ((_, _, _), _), ((None, _), ([], _, _), []) ->
+              Lwt.return_error
+                ( Some pr_id
+                , f
+                    "Could not find pipeline check for head commit %s and no \
+                     summary was passed.  (Found checks: %s) (Errored while \
+                     finding checks: %s)"
+                    head
+                    ( head_checks
+                    |> List.map ~f:(fun ({name}, _) -> name)
+                    |> String.concat ~sep:", " )
+                    ( head_checks_errors
+                    |> List.map ~f:(fun (name, _) -> name)
+                    |> String.concat ~sep:", " ) )
+          | ( ((_, _, _), _)
+            , ((None, _), ([], _, _), [(_head_check_name, head_check_error)]) )
             ->
+              Lwt.return_error
+                ( Some pr_id
+                , f
+                    "Could not successfully find pipeline check for head \
+                     commit %s and no summary was passed. Error: %s"
+                    head head_check_error )
+          | ( ((_, _, _), _)
+            , ( (None, _)
+              , ([], _, _)
+              , (_ :: _ :: _ as head_pipeline_checks_errors) ) ) ->
+              Lwt.return_error
+                ( Some pr_id
+                , f
+                    "Could not successfully find pipeline check for head \
+                     commit %s and no summary was passed. Found multiple \
+                     errors on head pipeline checks:\n\
+                     %s"
+                    head
+                    ( head_pipeline_checks_errors
+                    |> List.map ~f:(fun (name, error) ->
+                           f "- %s: %s" name error )
+                    |> String.concat ~sep:"\n" ) )
+          | ( ((_, _, _), _)
+            , ((None, _), ((_ :: _ :: _ as pipeline_head_checks), _, _), _) ) ->
               Lwt.return_error
                 ( Some pr_id
                 , f
@@ -1205,12 +1255,13 @@ let fetch_ci_minimization_info ~bot_info ~owner ~repo ~pr_number
                     ( pipeline_head_checks
                     |> List.map ~f:(fun ({name}, _) -> name)
                     |> String.concat ~sep:", " ) )
-          | ([({summary= None}, _)], _, _), ((_, _), (_, _, _)) ->
+          | (([({summary= None}, _)], _, _), _), ((_, _), (_, _, _), _) ->
               Lwt.return_error
                 ( Some pr_id
                 , f "Could not find pipeline check summary for base commit %s."
                     base )
-          | ([], _, _), ((_, _), (_, _, _)) ->
+          | (([], _, _), []), ((_, _), (_, _, _), _)
+            when List.is_empty base_checks_errors ->
               Lwt.return_error
                 ( Some pr_id
                 , f
@@ -1220,8 +1271,43 @@ let fetch_ci_minimization_info ~bot_info ~owner ~repo ~pr_number
                     ( base_checks
                     |> List.map ~f:(fun ({name}, _) -> name)
                     |> String.concat ~sep:", " ) )
-          | ((_ :: _ :: _ as pipeline_base_checks), _, _), ((_, _), (_, _, _))
-            ->
+          | (([], _, _), []), ((_, _), (_, _, _), _) ->
+              Lwt.return_error
+                ( Some pr_id
+                , f
+                    "Could not find pipeline check for base commit %s.  (Found \
+                     checks: %s) (Errored while finding checks: %s)"
+                    base
+                    ( base_checks
+                    |> List.map ~f:(fun ({name}, _) -> name)
+                    |> String.concat ~sep:", " )
+                    ( base_checks_errors
+                    |> List.map ~f:(fun (name, _) -> name)
+                    |> String.concat ~sep:", " ) )
+          | ( ( ([], _, _)
+              , [(_base_pipeline_check_name, base_pipeline_check_error)] )
+            , ((_, _), (_, _, _), _) ) ->
+              Lwt.return_error
+                ( Some pr_id
+                , f
+                    "Could not successfully find pipeline check for base \
+                     commit %s.  Error: %s"
+                    base base_pipeline_check_error )
+          | ( (([], _, _), (_ :: _ :: _ as base_pipeline_checks_errors))
+            , ((_, _), (_, _, _), _) ) ->
+              Lwt.return_error
+                ( Some pr_id
+                , f
+                    "Could not successfully find pipeline check for base \
+                     commit %s. Found multiple errors on base pipeline checks:\n\
+                     %s"
+                    base
+                    ( base_pipeline_checks_errors
+                    |> List.map ~f:(fun (name, error) ->
+                           f "- %s: %s" name error )
+                    |> String.concat ~sep:"\n" ) )
+          | ( (((_ :: _ :: _ as pipeline_base_checks), _, _), _)
+            , ((_, _), (_, _, _), _) ) ->
               Lwt.return_error
                 ( Some pr_id
                 , f
